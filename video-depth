@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Convert every input frame to relative depth using a local Core ML model."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+from fractions import Fraction
+from urllib.request import urlopen
+
+import numpy as np
+
+
+REVISION = "cfef6f6f2a70783dedc0bfae40cecbc2052285d3"
+PACKAGE = "DepthAnythingV2SmallF16.mlpackage"
+CHECKSUMS = {
+    "Manifest.json": "2883ae290c48fe916dc5ececac03a7d847fa277165a49ef5652fa1d2b9cb55f7",
+    "Data/com.apple.CoreML/model.mlmodel": "44ac97a3efcfd52113183fb2862ff59cd0368e9ec2e30a90a54980dd11407042",
+    "Data/com.apple.CoreML/weights/weight.bin": "fa60d9b6a155734f59029ebb882fd54e549bfaee3539c1a9cbd2cbbab64a0fed",
+}
+CACHE = Path(os.environ.get("VIDEO_DEPTH_CACHE", Path.home() / "Library/Caches/video-depth")).expanduser()
+
+
+def run(command, **kwargs):
+    return subprocess.run(command, check=True, **kwargs)
+
+
+def source_info(path):
+    result = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                             "stream=width,height,avg_frame_rate,duration:stream_side_data=rotation:stream_tags=rotate",
+                             "-of", "json", str(path)], capture_output=True).stdout)["streams"][0]
+    rotation = result.get("tags", {}).get("rotate", 0)
+    for item in result.get("side_data_list", []):
+        rotation = item.get("rotation", rotation)
+    width, height = result["width"], result["height"]
+    if round(float(rotation)) % 180:
+        width, height = height, width
+    fps = Fraction(result["avg_frame_rate"])
+    if fps <= 0:
+        raise ValueError("cannot determine source frame rate")
+    duration = float(result["duration"]) if "duration" in result else None
+    return width, height, fps, duration
+
+
+def content_size(width, height):
+    fit = min(518 / width, 392 / height)
+    return (min(518, round(width * fit * (1.5 if width < height else 1))),
+            min(392, round(height * fit * (1.5 if width >= height else 1))))
+
+
+def model_and_helper():
+    CACHE.mkdir(parents=True, exist_ok=True)
+    source = Path(__file__).resolve().with_name("infer.swift")
+    helper = CACHE / "infer"
+    if not helper.exists() or source.stat().st_mtime > helper.stat().st_mtime:
+        run(["swiftc", "-O", str(source), "-o", str(helper)])
+    package = CACHE / PACKAGE
+    changed = False
+    for name, checksum in CHECKSUMS.items():
+        target = package / name
+        if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() == checksum:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        pending = target.with_name(target.name + ".download")
+        url = f"https://huggingface.co/apple/coreml-depth-anything-v2-small/resolve/{REVISION}/{PACKAGE}/{name}"
+        digest = hashlib.sha256()
+        with urlopen(url, timeout=120) as response, pending.open("wb") as output:
+            while block := response.read(1024 * 1024):
+                output.write(block)
+                digest.update(block)
+        if digest.hexdigest() != checksum:
+            pending.unlink()
+            raise RuntimeError(f"model checksum failed: {name}")
+        pending.replace(target)
+        changed = True
+    compiled = CACHE / "DepthAnythingV2SmallF16.mlmodelc"
+    if changed or not compiled.exists():
+        run([str(helper), "compile", str(package), str(compiled)])
+    return helper, compiled
+
+
+def infer(source, helper, model, width, height, target):
+    decoder = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(source), "-fps_mode", "passthrough",
+                                "-pix_fmt", "bgra", "-f", "rawvideo", "-"], stdout=subprocess.PIPE)
+    swift = subprocess.Popen([str(helper), "run", str(model), str(width), str(height), str(target)],
+                              stdin=decoder.stdout)
+    decoder.stdout.close()
+    if swift.wait() or decoder.wait():
+        raise RuntimeError("depth inference failed")
+
+
+def align(raw, target, count):
+    """Match adjacent depth ranges while retaining some original scale to limit drift."""
+    target[0] = raw[0]
+    for i in range(1, count):
+        x = np.asarray(raw[i]).ravel()
+        y = np.asarray(target[i - 1]).ravel()
+        keep = np.isfinite(x) & np.isfinite(y)
+        if keep.sum() < 100:
+            target[i] = raw[i]
+            continue
+        a, b = 1.0, 0.0
+        for _ in range(2):
+            xx, yy = x[keep], y[keep]
+            if xx.size < 100:
+                break
+            mx, my = xx.mean(), yy.mean()
+            variance = np.mean((xx - mx) ** 2)
+            a = 1.0 if variance < 1e-8 else np.mean((xx - mx) * (yy - my)) / variance
+            b = my - a * mx
+            residual = np.abs(a * x + b - y)
+            keep = np.isfinite(residual) & (residual <= np.percentile(residual[keep], 80))
+        a, b = np.clip(a, 0.65, 1.5), np.clip(b, -0.25, 0.25)
+        target[i] = 0.85 * (a * raw[i] + b) + 0.15 * raw[i]
+
+
+def encode(depth, count, fps, width, height, target):
+    cw, ch = depth.shape[2], depth.shape[1]
+    out_width, out_height = width + width % 2, height + height % 2
+    process = subprocess.Popen(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "gray",
+                                "-s", f"{cw}x{ch}", "-framerate", str(fps), "-i", "-",
+                                "-vf", f"scale={out_width}:{out_height}:flags=bicubic", "-c:v", "libx264",
+                                "-crf", "14", "-pix_fmt", "yuv420p", "-an", str(target)], stdin=subprocess.PIPE)
+    low, high = np.percentile(depth[0], [2, 98])
+    for i in range(count):
+        frame_low, frame_high = np.percentile(depth[i], [2, 98])
+        low += 0.08 * (frame_low - low)
+        high += 0.08 * (frame_high - high)
+        frame = np.clip((depth[i] - low) * (255 / max(high - low, 1e-6)) + .5, 0, 255).astype(np.uint8)
+        process.stdin.write(frame.tobytes())
+    process.stdin.close()
+    if process.wait():
+        raise RuntimeError("video encoding failed")
+
+
+def main():
+    if len(sys.argv) != 3:
+        sys.exit("usage: ./video-depth input.mp4 output.mp4")
+    source, output = map(Path, sys.argv[1:])
+    if not source.is_file():
+        sys.exit("input video does not exist")
+    if source.resolve() == output.resolve():
+        sys.exit("input and output must differ")
+    began = time.monotonic()
+    width, height, fps, duration = source_info(source)
+    cw, ch = content_size(width, height)
+    helper, model = model_and_helper()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="video-depth-") as directory:
+        raw_file = Path(directory) / "raw.f32"
+        infer(source, helper, model, width, height, raw_file)
+        frame_bytes = cw * ch * 4
+        if raw_file.stat().st_size % frame_bytes:
+            raise RuntimeError("incomplete depth frame")
+        count = raw_file.stat().st_size // frame_bytes
+        if not count:
+            raise RuntimeError("no video frames")
+        raw = np.memmap(raw_file, np.float32, mode="r", shape=(count, ch, cw))
+        depth = np.memmap(Path(directory) / "aligned.f32", np.float32, mode="w+", shape=(count, ch, cw))
+        align(raw, depth, count)
+        if duration and abs(count / float(fps) - duration) > .001:
+            fps = (Fraction(count) / Fraction(str(duration))).limit_denominator(1000000)
+        encode(depth, count, fps, width, height, output)
+    elapsed = time.monotonic() - began
+    print(f"frames={count} fps={fps} duration={count / float(fps):.3f}s elapsed={elapsed:.1f}s ({elapsed/count:.3f}s/frame)")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+        sys.exit(str(error))
