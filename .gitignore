@@ -22,3 +22,6 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# README 예시 파일은 저장소에 포함
+!docs/demo/*
