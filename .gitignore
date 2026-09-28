@@ -1,3 +1,24 @@
+# 로컬 실행 결과와 샘플
 work/
 outputs/
+*.mp4
+*.mov
+*.m4v
+*.png
+*.jpg
+*.jpeg
+*.f32
+*.npy
+
+# Core ML 모델과 컴파일 결과 (첫 실행 때 ~/Library/Caches/video-depth에 받음)
+*.mlpackage/
+*.mlmodelc/
+
+# Python·Swift 빌드 산출물
 __pycache__/
+*.pyc
+.build/
+*.o
+
+# macOS
+.DS_Store
