@@ -1,6 +1,6 @@
-# video-depth
+# core-ml-motion-depth-tool
 
-영상 파일을 프레임별 depth 영상으로 변환하는 macOS CLI입니다. 밝을수록 카메라에 가깝습니다. 영상은 로컬에서 처리하며 첫 실행 때 모델만 내려받습니다.
+영상 파일을 프레임별 depth 영상으로 변환하는 macOS CLI `video-depth`입니다. 밝을수록 카메라에 가깝습니다. 영상은 로컬에서 처리하며 첫 실행 때 모델만 내려받습니다.
 
 ## 설치
 
